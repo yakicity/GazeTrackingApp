@@ -146,20 +146,25 @@ class GazeEstimator:
 
 # ================== Region 集計 ==================
 class RegionTimer:
-    def __init__(self):
-        self.stats = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
+    def __init__(self, num_regions: int):
+        self.num_regions = num_regions
+        # 指定されたリージョン数でstats辞書を初期化
+        self.stats = {i: 0.0 for i in range(1, self.num_regions + 1)}
         self.last_ts = None
 
-    @staticmethod
-    def region_of(x: int, y: int, w: int, h: int) -> int:
-        cx, cy = w // 2, h // 2
-        if x < cx and y < cy:
-            return 1
-        if x >= cx and y < cy:
-            return 2
-        if x < cx and y >= cy:
+    def region_of(self, x: int, y: int, w: int, h: int) -> int:
+        if self.num_regions == 4:
+            cx, cy = w // 2, h // 2
+            if x < cx and y < cy: return 1
+            if x >= cx and y < cy: return 2
+            if x < cx and y >= cy: return 3
+            return 4
+        elif self.num_regions == 3:
+            # 縦に3分割
+            if x < w / 3: return 1
+            if x < 2 * w / 3: return 2
             return 3
-        return 4
+        return 1
 
     def update(self, gaze_px: Tuple[int, int], w: int, h: int):
         now = time.time()
@@ -170,16 +175,73 @@ class RegionTimer:
         r = self.region_of(gaze_px[0], gaze_px[1], w, h)
         self.stats[r] += dt
         self.last_ts = now
+
 def y_intercept(rx_left, rx_right, w):
-    a = w / (rx_right - rx_left)  # 傾き
-    b = -(w/2) * (rx_right + rx_left) / (rx_right - rx_left)  # y切片
+    if abs(rx_right - rx_left) < 1e-9: return 0, 0
+    a = w / (rx_right - rx_left)
+    b = -(w/2) * (rx_right + rx_left) / (rx_right - rx_left)
     return a, b
 
-# ================ Video Processor（キャリブ対応） =================
+# ================== ★★★ ヒートマップ生成クラス (新規追加) ★★★ ==================
+class HeatmapGenerator:
+    def __init__(self, width: int, height: int):
+        self.width = width
+        self.height = height
+        self.heatmap_data = np.zeros((height, width), dtype=np.float64)
+        self.decay_rate = 0.98
+        self.intensity = 5.0
+        self.radius = int(max(width, height) * 0.15) # ミニマップ内での半径を少し大きく
+
+    def update(self, gaze_point: Tuple[int, int]):
+        x, y = gaze_point
+        if x is None or y is None: return
+
+        # NumPyのスライシングとmeshgridを使って高速にガウス分布を適用
+        x_grid, y_grid = np.ogrid[:self.height, :self.width]
+        dist_sq = (x_grid - y)**2 + (y_grid - x)**2
+
+        gauss = self.intensity * np.exp(-dist_sq / (2 * (self.radius / 2)**2))
+        self.heatmap_data += gauss
+
+    def decay(self):
+        self.heatmap_data *= self.decay_rate
+        self.heatmap_data[self.heatmap_data < 0.01] = 0
+
+    def generate_minimap_image(self, current_gaze_point: Optional[Tuple[int, int]]) -> np.ndarray:
+        # 1. ミニマップの背景を作成
+        minimap_bg = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        cv2.rectangle(minimap_bg, (0, 0), (self.width, self.height), (30, 30, 30), -1)
+
+        # 2. ヒートマップを描画
+        if np.max(self.heatmap_data) > 0:
+            norm_heatmap = self.heatmap_data / np.max(self.heatmap_data)
+            heatmap_8u = (norm_heatmap * 255).astype(np.uint8)
+            heatmap_color = cv2.applyColorMap(heatmap_8u, cv2.COLORMAP_JET)
+            # ヒートマップを背景に重ね合わせ
+            minimap_bg = cv2.addWeighted(minimap_bg, 0.5, heatmap_color, 0.5, 0)
+
+        # 3. グリッド線を描画
+        for i in range(1, 4):
+            x = (i * self.width) // 4
+            cv2.line(minimap_bg, (x, 0), (x, self.height), (80, 80, 80), 1)
+        for i in range(1, 3):
+            y = (i * self.height) // 3
+            cv2.line(minimap_bg, (0, y), (self.width, y), (80, 80, 80), 1)
+
+        # 4. 現在の視線位置を描画 (赤い点)
+        if current_gaze_point:
+            cv2.circle(minimap_bg, current_gaze_point, 5, (0, 0, 255), -1)
+            cv2.circle(minimap_bg, current_gaze_point, 7, (255, 255, 255), 1)
+
+        # 5. 外枠を描画
+        cv2.rectangle(minimap_bg, (0, 0), (self.width - 1, self.height - 1), (255, 255, 255), 1)
+
+        return minimap_bg
+
+# ================ Video Processor（キャリブ・ヒートマップ対応） =================
 class VideoProcessor:
     def __init__(self):
         self.est = GazeEstimator(0.5, 0.5)
-        self.timer = RegionTimer()
         self.running = False
 
         # ---- キャリブレーション状態 ----
@@ -204,6 +266,17 @@ class VideoProcessor:
         self.fps_start_time = 0
         self.fps_frame_count = 0
         self.fps = 0.0
+
+        # ★★★ ヒートマップ関連の変数を追加 ★★★
+        self.minimap_width = 220
+        self.minimap_height = 140
+        self.heatmap_generator = HeatmapGenerator(self.minimap_width, self.minimap_height)
+        self.show_heatmap = True # UIから変更される
+
+        # UIから渡されるのを待つため、デフォルト値で初期化
+        self.num_regions = st.session_state.get("num_regions", 4)
+        self.timer = RegionTimer(self.num_regions)
+
 
     def start_calibration(self):
         self.calibrating = True
@@ -267,6 +340,15 @@ class VideoProcessor:
         scale_y = y_intercept(ry_top, ry_bottom, h)[0]
         offx = y_intercept(rx_left, rx_right, w)[1]
         offy = y_intercept(ry_top, ry_bottom, h)[1]
+        # scale_x, offx = y_intercept(rx_left, rx_right, w)
+        # scale_y, offy = y_intercept(ry_top, ry_bottom, h)
+        # if scale_x is None: return False, "y_intercept calculation failed for x"
+        # if scale_y is None:
+        #     # Fallback or specific logic for ry_top/ry_bottom if needed
+        #     ry_dx = ry_bottom - ry_top
+        #     if abs(ry_dx) < 1e-9: return False, "Vertical difference too small"
+        #     scale_y = h / ry_dx
+        #     offy = - (h/2) * (ry_bottom + ry_top) / ry_dx
 
         # 推定値を保存（スケールは estimate() 内で毎フレーム w,h から再計算）
         self.est.set_calibration_values(
@@ -280,11 +362,15 @@ class VideoProcessor:
                       f"scale_x={scale_x:.1f}, scale_y={scale_y:.1f} @ {w}x{h},"
                       f" samples={rx_left, rx_right, ry_top, ry_bottom}")
 
-    # ---- 描画 ----
+
     def _draw_guides(self, frame):
         h, w, _ = frame.shape
-        cv2.line(frame, (w//2, 0), (w//2, h), (0, 0, 255), 2)
-        cv2.line(frame, (0, h//2), (w, h//2), (0, 0, 255), 2)
+        if self.num_regions == 4:
+            cv2.line(frame, (w//2, 0), (w//2, h), (0, 0, 255), 2)
+            cv2.line(frame, (0, h//2), (w, h//2), (0, 0, 255), 2)
+        elif self.num_regions == 3:
+            cv2.line(frame, (w//3, 0), (w//3, h), (0, 0, 255), 2)
+            cv2.line(frame, (2*w//3, 0), (2*w//3, h), (0, 0, 255), 2)
 
     def _draw_calib_target(self, frame):
         if not self.calibrating:
@@ -314,6 +400,7 @@ class VideoProcessor:
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="bgr24")
         img = cv2.flip(img, 1)
+        h, w, _ = img.shape
         self.last_w, self.last_h = img.shape[1], img.shape[0]
         # print("b",img.shape[1], img.shape[0])
 
@@ -328,44 +415,81 @@ class VideoProcessor:
             self.fps_frame_count = 0
             self.fps_start_time = time.time()
 
-        ok, eye_px, end_px, raw_vec = self.est.estimate(img)
-
-
         # キャリブ収集
-        if self.calibrating and self.capture_request and ok and raw_vec is not None:
-            rx, ry = raw_vec
-            self.capture_buffer.append((rx, ry, eye_px[0], eye_px[1]))
+        if self.calibrating and self.capture_request and ok and raw_vec:
+            self.capture_buffer.append((raw_vec[0], raw_vec[1], eye_px[0], eye_px[1]))
             if len(self.capture_buffer) >= 15:
-                avg = np.mean(self.capture_buffer, axis=0)  # (rx, ry, ex, ey)
+                avg = np.mean(self.capture_buffer, axis=0)
                 name, _, _ = self.targets[self.target_idx]
-                # ★上書きOK（取り直し対応）
-                self.samples[name] = (float(avg[0]), float(avg[1]), float(avg[2]), float(avg[3]))
-                # ★次のターゲットへ
+                self.samples[name] = tuple(float(v) for v in avg)
                 self.capture_request = False
                 self.capture_buffer.clear()
                 self.target_idx += 1
-                if self.target_idx >= len(self.targets):
-                    self.calib_ready = True
+                if self.target_idx >= len(self.targets): self.calib_ready = True
 
-        if self.running and ok and end_px is not None:
-            self.timer.update(end_px, img.shape[1], img.shape[0])
+        # ★★★ ミニマップ用に視線座標をスケーリングして更新 ★★★
+        current_minimap_gaze = None
+        if self.running and ok and end_px:
+            self.timer.update(end_px, w, h)
+            if self.show_heatmap:
+                # 画面全体の座標をミニマップ座標に変換
+                minimap_x = int((end_px[0] / w) * self.minimap_width)
+                minimap_y = int((end_px[1] / h) * self.minimap_height)
+                current_minimap_gaze = (minimap_x, minimap_y)
+                self.heatmap_generator.update(current_minimap_gaze)
 
+        # ★★★ ヒートマップを減衰させ、ミニマップを生成して貼り付け ★★★
+        if self.show_heatmap:
+            self.heatmap_generator.decay()
+            minimap_image = self.heatmap_generator.generate_minimap_image(current_minimap_gaze)
+
+            # 画面右下にミニマップを配置
+            margin = 10
+            map_h, map_w, _ = minimap_image.shape
+            y_offset = h - map_h - margin
+            x_offset = w - map_w - margin
+
+            # NumPyスライシングで画像を合成
+            img[y_offset:y_offset + map_h, x_offset:x_offset + map_w] = minimap_image
+
+        # 描画処理
         img = self.draw_overlay(img, eye_px if ok else None, end_px if ok else None)
         self._draw_guides(img)
-        self._draw_calib_target(img)
+
+        if self.calibrating and not self.calib_ready and self.target_idx < len(self.targets):
+            name, nx, ny = self.targets[self.target_idx]
+            px, py = int(nx * w), int(ny * h)
+            cv2.circle(img, (px, py), 16, (0, 255, 0), 3)
+            cv2.circle(img, (px, py), 6, (0, 255, 255), -1)
 
         fps_text = f"FPS: {self.fps:.1f}"
         cv2.putText(img, fps_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
+        # self._draw_guides(img)
+        # self._draw_calib_target(img)
+
+        # fps_text = f"FPS: {self.fps:.1f}"
+        # cv2.putText(img, fps_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        # return av.VideoFrame.from_ndarray(img, format="bgr24")
+
 
     # UI側から呼ぶ
     def apply_calibration(self) -> Tuple[bool, str]:
         return self._compute_and_apply_calibration()
 
+def get_region_labels(num_regions: int) -> Dict[int, str]:
+    """リージョン数に応じたラベルを返す"""
+    if num_regions == 4:
+        return {1: "① 左上", 2: "② 右上", 3: "③ 左下", 4: "④ 右下"}
+    if num_regions == 3:
+        return {1: "① 左", 2: "② 中央", 3: "③ 右"}
+    # 他のリージョン数が必要な場合はここに追加
+    return {i: f"エリア {i}" for i in range(1, num_regions + 1)}
 
-# ================= PDF（そのまま） =================
+
+# ================= PDF=================
 JAPANESE_FONT_PATH = "ipaexg00401/ipaexg.ttf"
 
 def create_history_pdf(history_data: list) -> io.BytesIO:
@@ -376,6 +500,11 @@ def create_history_pdf(history_data: list) -> io.BytesIO:
     pdf.cell(0, 10, "アイトラッキング分析履歴", 0, 1, 'C')
     pdf.ln(10)
     for item in reversed(history_data):
+        stats = item.get("stats", {})
+        num_regions = len(stats)
+        if num_regions == 0: continue
+        labels = get_region_labels(num_regions)
+
         pdf.set_font('Japanese', '', 12)
         pdf.cell(0, 10, f"記録日時: {item['time']}", 0, 1)
         pdf.set_font('Japanese', '', 10)
@@ -384,32 +513,52 @@ def create_history_pdf(history_data: list) -> io.BytesIO:
         pdf.cell(cell_width, cell_height, "範囲", border=1, fill=True, align='C')
         pdf.cell(cell_width, cell_height, "合計秒", border=1, fill=True, align='C')
         pdf.ln()
-        s = item["stats"]
-        rows = [("① 左上", s[1]), ("② 右上", s[2]), ("③ 左下", s[3]), ("④ 右下", s[4])]
-        for row in rows:
-            pdf.cell(cell_width, cell_height, row[0], border=1)
-            pdf.cell(cell_width, cell_height, f"{row[1]:.1f} 秒", border=1)
+        for i in range(1, num_regions + 1):
+            pdf.cell(cell_width, cell_height, labels.get(i, f"Region {i}"), border=1)
+            pdf.cell(cell_width, cell_height, f"{stats.get(i, 0.0):.1f}", border=1)
             pdf.ln()
         pdf.ln(10)
     return io.BytesIO(pdf.output())
 
 
 # ================= Streamlit UI ==================
-st.set_page_config(page_title="簡易アイトラッキング（キャリブ版）", layout="wide")
+st.set_page_config(page_title="簡易アイトラッキング（ヒートマップ版）", layout="wide")
 st.title("簡易アイトラッキング")
 
 # セッションステート初期化
 if "history" not in st.session_state:
     st.session_state.history = []
-if "current_stats" not in st.session_state:
-    st.session_state.current_stats = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
+if "num_regions" not in st.session_state:
+    st.session_state.num_regions = 4 # デフォルト値
 if "running" not in st.session_state:
     st.session_state.running = False
+
+def on_region_change():
+    st.session_state.num_regions = st.session_state.selectbox_regions
+    st.session_state.current_stats = {i: 0.0 for i in range(1, st.session_state.num_regions + 1)}
+
+
+num_regions = st.sidebar.selectbox(
+    "分析エリアの分割数を選択", [3, 4],
+    index=[3, 4].index(st.session_state.num_regions),
+    on_change=on_region_change,
+    key='selectbox_regions'
+)
+
+if "current_stats" not in st.session_state or len(st.session_state.current_stats) != st.session_state.num_regions:
+    st.session_state.current_stats = {i: 0.0 for i in range(1, st.session_state.num_regions + 1)}
+
+region_labels = get_region_labels(st.session_state.num_regions)
+
+
 
 cols = st.columns([1, 1])
 
 with cols[0]:
     st.subheader("カメラ映像")
+    # ★★★ UIにヒートマップのチェックボックスを追加 ★★★
+    show_heatmap_toggle = st.checkbox("ヒートマップを表示", value=True)
+
     rtc_config = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
     ctx = webrtc_streamer(
         key="eyetracking",
@@ -420,23 +569,30 @@ with cols[0]:
         media_stream_constraints={"video": True, "audio": False},
     )
 
+    # ★★★ チェックボックスの状態をVideoProcessorに渡す ★★★
+    if ctx.state.playing and ctx.video_processor:
+        ctx.video_processor.show_heatmap = show_heatmap_toggle
+        # VideoProcessorのリージョン数をUIの選択に同期
+        if ctx.video_processor.num_regions != st.session_state.num_regions:
+            ctx.video_processor.num_regions = st.session_state.num_regions
+            ctx.video_processor.timer = RegionTimer(st.session_state.num_regions)
+
+
     c1, c2, c3 = st.columns(3)
     with c1:
         if st.button("分析開始", use_container_width=True):
-            if not ctx or not ctx.state.playing:
-                st.warning("カメラを起動して下さい")
-            else:
+            if ctx.state.playing:
                 st.session_state.running = True
                 if ctx.video_processor:
+                    # タイマーを現在のリージョン数でリセット
+                    ctx.video_processor.num_regions = st.session_state.num_regions
                     ctx.video_processor.running = True
-                    ctx.video_processor.timer = RegionTimer()
+                    ctx.video_processor.timer = RegionTimer(st.session_state.num_regions)
+                    st.session_state.current_stats = ctx.video_processor.timer.stats.copy()
+            else: st.warning("カメラを起動して下さい")
     with c2:
         if st.button("分析終了", use_container_width=True):
-            if not ctx or not ctx.state.playing:
-                st.warning("カメラを起動して下さい")
-            elif not st.session_state.running:
-                st.warning("まだ分析は開始されていません")
-            else:
+            if ctx.state.playing and st.session_state.running:
                 st.session_state.running = False
                 if ctx.video_processor:
                     ctx.video_processor.running = False
@@ -446,16 +602,16 @@ with cols[0]:
                         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "stats": stats.copy(),
                     })
+            else: st.warning("分析が開始されていません")
     with c3:
         if st.button("キャリブ開始", use_container_width=True):
-            if not ctx or not ctx.state.playing:
-                st.warning("カメラを起動して下さい")
-            else:
+            if ctx.state.playing:
                 ctx.video_processor.start_calibration()
-                st.success("キャリブを開始。左上→右上→左下→右下で『サンプル取得』を押してください。")
+                st.success("キャリブを開始。各ターゲットを見て『サンプル取得』を押してください。")
+            else: st.warning("カメラを起動して下さい")
 
-    # キャリブ操作
-    if ctx and ctx.video_processor and ctx.video_processor.calibrating:
+    # 進捗の行を順序通りに
+    if ctx.state.playing and ctx.video_processor and ctx.video_processor.calibrating:
         d1, d2, d3 = st.columns(3)
         with d1:
             if st.button("サンプル取得（15f）", use_container_width=True):
@@ -472,46 +628,36 @@ with cols[0]:
         with d3:
             if st.button("適用"):
                 ok, msg = ctx.video_processor.apply_calibration()
-                if ok:
-                    st.success(msg)
-                else:
-                    st.error(msg)
-            if ctx and ctx.video_processor and ctx.video_processor.calibrating:
-                # 進捗の行を順序通りに
-                order = [t[0] for t in ctx.video_processor.targets]
-                marks = ["✅" if name in ctx.video_processor.samples else "⬜" for name in order]
-                st.caption("取得状況: " + " | ".join([f"{m} {n}" for m, n in zip(marks, order)]))
+                if ok: st.success(msg)
+                else: st.error(msg)
 
-                # 次のターゲット名
-                if ctx.video_processor.calib_ready:
-                    st.success("四隅のサンプルが揃いました。『適用』を押してください。")
-                else:
-                    next_name = order[ctx.video_processor.target_idx] if ctx.video_processor.target_idx < len(order) else "—"
-                    st.caption(f"次のターゲット: {next_name}")
+        order = [t[0] for t in ctx.video_processor.targets]
+        marks = ["✅" if name in ctx.video_processor.samples else "⬜" for name in order]
+        st.caption("取得状況: " + " | ".join(f"{m} {n}" for m, n in zip(marks, order)))
+        if ctx.video_processor.calib_ready:
+            st.success("四隅のサンプルが揃いました。『適用』を押してください。")
+        elif ctx.video_processor.target_idx < len(order):
+            st.caption(f"次のターゲット: {order[ctx.video_processor.target_idx]}")
 
-
-    # ラン中は最新値反映
-    if ctx and ctx.video_processor and st.session_state.running:
+    if ctx.state.playing and ctx.video_processor and st.session_state.running:
         st.session_state.current_stats = ctx.video_processor.timer.stats
-
 with cols[1]:
-    st.subheader("今回の分析結果（どこを何秒見たか）")
+    st.subheader("今回の分析結果")
     cur = st.session_state.current_stats
-    table_rows = [("① 左上", cur[1]), ("② 右上", cur[2]), ("③ 左下", cur[3]), ("④ 右下", cur[4])]
+    # ★ テーブル表示を動的に生成
+    table_rows = [(region_labels.get(i, f"エリア {i}"), cur.get(i, 0.0)) for i in range(1, num_regions + 1)]
     st.table({"範囲": [r[0] for r in table_rows], "合計秒": [f"{r[1]:.1f}" for r in table_rows]})
 
-    json_obj = {
+    # ★ JSON出力を動的に生成
+    json_str = json.dumps({
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "結果": {
-            "対象範囲：①": {"合計秒数": f"{cur[1]:.1f}s"},
-            "対象範囲：②": {"合計秒数": f"{cur[2]:.1f}s"},
-            "対象範囲：③": {"合計秒数": f"{cur[3]:.1f}s"},
-            "対象範囲：④": {"合計秒数": f"{cur[4]:.1f}s"},
-        },
-    }
+        "results": {
+            region_labels.get(i, f"Region {i}"): {"duration_sec": f"{cur.get(i, 0.0):.1f}"}
+            for i in range(1, num_regions + 1)
+        }
+    }, ensure_ascii=False, indent=2)
     st.download_button(
-        label="今回の結果をJSONでダウンロード",
-        data=json.dumps(json_obj, ensure_ascii=False, indent=2),
+        label="結果をJSONでダウンロード", data=json_str,
         file_name=f"gaze_stats_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
         mime="application/json",
     )
@@ -536,6 +682,9 @@ else:
 
     for item in reversed(st.session_state.history):
         with st.expander(f"{item['time']} の結果"):
-            s = item["stats"]
-            rows = [("① 左上", s[1]), ("② 右上", s[2]), ("③ 左下", s[3]), ("④ 右下", s[4])]
+            stats = item.get("stats", {})
+            num_regions_in_history = len(stats)
+            if num_regions_in_history == 0: continue
+            history_labels = get_region_labels(num_regions_in_history)
+            rows = [(history_labels.get(i, f"エリア {i}"), stats.get(i, 0.0)) for i in history_labels]
             st.table({"範囲": [r[0] for r in rows], "合計秒": [f"{r[1]:.1f}" for r in rows]})
